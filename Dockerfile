@@ -1,6 +1,6 @@
 # ── Stage 1: cargo-chef planner ───────────────────────────────────────────
-# Resolves dependency tree from Cargo manifests only (no source files).
-# Re-runs only when Cargo.toml or Cargo.lock changes.
+# Uses node:24-alpine + rustup (no official rust:nightly alpine image exists).
+# Extracts dependency recipe from Cargo manifests — re-runs only on Cargo changes.
 FROM node:24-alpine AS planner
 
 # hadolint ignore=DL3018
@@ -8,7 +8,6 @@ RUN apk add --no-cache musl-dev build-base curl
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Install pinned Rust nightly (no official nightly alpine image exists)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --profile minimal --default-toolchain nightly-2025-12-04
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -34,14 +33,12 @@ RUN apk add --no-cache \
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Install pinned Rust nightly
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --profile minimal --default-toolchain nightly-2025-12-04
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN cargo install cargo-chef --locked
 
-# Install pinned pnpm
 # hadolint ignore=DL3016
 RUN npm install -g pnpm@10.13.1
 
@@ -53,13 +50,13 @@ ENV VITE_PUBLIC_POSTHOG_HOST=$POSTHOG_API_ENDPOINT
 WORKDIR /app
 
 # ── Rust dependency cache layer ───────────────────────────────────────────
-# Only re-runs when Cargo.toml / Cargo.lock changes — not on source changes
+# Re-runs only when Cargo.toml / Cargo.lock changes, not on source changes
 COPY --from=planner /app/recipe.json recipe.json
 COPY Cargo.toml Cargo.lock rust-toolchain.toml .cargo* ./
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # ── Node dependency cache layer ───────────────────────────────────────────
-# Only re-runs when pnpm-lock.yaml / package.json changes
+# Re-runs only when pnpm-lock.yaml / package.json changes
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY packages/local-web/package.json ./packages/local-web/
 COPY packages/web-core/package.json ./packages/web-core/
