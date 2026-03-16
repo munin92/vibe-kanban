@@ -1,82 +1,99 @@
-# Build stage
+# ── Stage 1: cargo-chef planner ───────────────────────────────────────────
+# Generates a recipe.json with all Rust dependency info.
+# This layer only re-runs when Cargo.toml / Cargo.lock changes.
+FROM rust:nightly-2025-12-04-alpine AS planner
+# hadolint ignore=DL3018
+RUN apk add --no-cache musl-dev && \
+    cargo install cargo-chef --locked
+WORKDIR /app
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: builder ──────────────────────────────────────────────────────
 FROM node:24-alpine AS builder
 
-# Install build dependencies
+# Install system build dependencies (incl. glib-dev for glib-sys crate)
+# hadolint ignore=DL3018
 RUN apk add --no-cache \
-    curl \
     build-base \
     perl \
     llvm-dev \
-    clang-dev
+    clang-dev \
+    glib-dev \
+    curl
 
-# Allow linking libclang on musl
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Install pinned Rust nightly via rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain nightly-2025-12-04
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install cargo-chef for dependency caching
+RUN cargo install cargo-chef --locked
+
+# Install pinned pnpm
+# hadolint ignore=DL3016
+RUN npm install -g pnpm@10.13.1
 
 ARG POSTHOG_API_KEY
 ARG POSTHOG_API_ENDPOINT
-
 ENV VITE_PUBLIC_POSTHOG_KEY=$POSTHOG_API_KEY
 ENV VITE_PUBLIC_POSTHOG_HOST=$POSTHOG_API_ENDPOINT
 
-# Set working directory
 WORKDIR /app
 
-# Copy package files for dependency caching
-COPY package*.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY packages/local-web/package*.json ./packages/local-web/
-COPY npx-cli/package*.json ./npx-cli/
+# ── Rust dependency cache layer ───────────────────────────────────────────
+# Only re-runs when Cargo.toml / Cargo.lock changes (not on source changes)
+COPY --from=planner /app/recipe.json recipe.json
+COPY Cargo.toml Cargo.lock rust-toolchain.toml .cargo* ./
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Install pnpm and dependencies
-RUN npm install -g pnpm && pnpm install
+# ── Node dependency cache layer ───────────────────────────────────────────
+# Only re-runs when pnpm-lock.yaml / package.json changes
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY packages/local-web/package.json ./packages/local-web/
+COPY packages/web-core/package.json ./packages/web-core/
+COPY packages/ui/package.json ./packages/ui/
+COPY npx-cli/package.json ./npx-cli/
+RUN pnpm install --frozen-lockfile
 
-# Copy source code
+# ── Full source + build ───────────────────────────────────────────────────
 COPY . .
 
-# Build application
+# Generate types, build frontend, build Rust binary
 RUN npm run generate-types
 RUN cd packages/local-web && pnpm run build
 RUN cargo build --release --bin server
 
-# Runtime stage
-FROM alpine:latest AS runtime
+# ── Stage 3: minimal runtime ──────────────────────────────────────────────
+FROM alpine:3.23 AS runtime
 
-# Install runtime dependencies
+# hadolint ignore=DL3018
 RUN apk add --no-cache \
     ca-certificates \
     tini \
     libgcc \
-    wget
-
-# Create app user for security
-RUN addgroup -g 1001 -S appgroup && \
+    wget && \
+    addgroup -g 1001 -S appgroup && \
     adduser -u 1001 -S appuser -G appgroup
 
-# Copy binary from builder
 COPY --from=builder /app/target/release/server /usr/local/bin/server
 
-# Create repos directory and set permissions
 RUN mkdir -p /repos && \
     chown -R appuser:appgroup /repos
 
-# Switch to non-root user
 USER appuser
 
-# Set runtime environment
 ENV HOST=0.0.0.0
 ENV PORT=3000
 EXPOSE 3000
 
-# Set working directory
 WORKDIR /repos
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --quiet --tries=1 --spider "http://${HOST:-localhost}:${PORT:-3000}" || exit 1
 
-# Run the application
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["server"]
