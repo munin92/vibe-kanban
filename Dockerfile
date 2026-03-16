@@ -1,19 +1,28 @@
 # ── Stage 1: cargo-chef planner ───────────────────────────────────────────
-# Generates a recipe.json with all Rust dependency info.
-# This layer only re-runs when Cargo.toml / Cargo.lock changes.
-FROM rust:nightly-2025-12-04-alpine AS planner
+# Resolves dependency tree from Cargo manifests only (no source files).
+# Re-runs only when Cargo.toml or Cargo.lock changes.
+FROM node:24-alpine AS planner
+
 # hadolint ignore=DL3018
-RUN apk add --no-cache musl-dev && \
-    cargo install cargo-chef --locked
+RUN apk add --no-cache musl-dev build-base curl
+
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+# Install pinned Rust nightly (no official nightly alpine image exists)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain nightly-2025-12-04
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN cargo install cargo-chef --locked
+
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ ./crates/
 RUN cargo chef prepare --recipe-path recipe.json
 
-# ── Stage 2: builder ──────────────────────────────────────────────────────
+# ── Stage 2: full builder (Node + Rust) ───────────────────────────────────
 FROM node:24-alpine AS builder
 
-# Install system build dependencies (incl. glib-dev for glib-sys crate)
 # hadolint ignore=DL3018
 RUN apk add --no-cache \
     build-base \
@@ -25,12 +34,11 @@ RUN apk add --no-cache \
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Install pinned Rust nightly via rustup
+# Install pinned Rust nightly
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --profile minimal --default-toolchain nightly-2025-12-04
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Install cargo-chef for dependency caching
 RUN cargo install cargo-chef --locked
 
 # Install pinned pnpm
@@ -45,7 +53,7 @@ ENV VITE_PUBLIC_POSTHOG_HOST=$POSTHOG_API_ENDPOINT
 WORKDIR /app
 
 # ── Rust dependency cache layer ───────────────────────────────────────────
-# Only re-runs when Cargo.toml / Cargo.lock changes (not on source changes)
+# Only re-runs when Cargo.toml / Cargo.lock changes — not on source changes
 COPY --from=planner /app/recipe.json recipe.json
 COPY Cargo.toml Cargo.lock rust-toolchain.toml .cargo* ./
 RUN cargo chef cook --release --recipe-path recipe.json
@@ -62,7 +70,6 @@ RUN pnpm install --frozen-lockfile
 # ── Full source + build ───────────────────────────────────────────────────
 COPY . .
 
-# Generate types, build frontend, build Rust binary
 RUN npm run generate-types
 RUN cd packages/local-web && pnpm run build
 RUN cargo build --release --bin server
