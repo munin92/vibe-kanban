@@ -33,7 +33,8 @@ COPY shared/ shared/
 RUN pnpm -C packages/remote-web build
 
 # ── Stage 2: cargo-chef planner ───────────────────────────────────────────
-# Extracts dependency recipe — re-runs only when Cargo.toml/Cargo.lock changes.
+# cargo chef prepare must run from the workspace root of crates/remote
+# (it is a separate workspace, excluded from the main Cargo.toml)
 FROM rust:1.93-slim-bookworm AS planner
 
 RUN apt-get update \
@@ -42,15 +43,12 @@ RUN apt-get update \
 
 RUN cargo install cargo-chef --locked
 
-WORKDIR /app
+WORKDIR /app/crates/remote
 
-COPY rust-toolchain.toml ./
-COPY Cargo.toml Cargo.lock ./
-# Only copy remote workspace Cargo.toml (isolated workspace, no relay-tunnel conflicts)
-COPY crates/remote/Cargo.toml ./crates/remote/
-COPY crates/remote/Cargo.lock ./crates/remote/
+COPY crates/remote/Cargo.toml crates/remote/Cargo.lock ./
 
-RUN cargo chef prepare --recipe-path recipe.json --manifest-path crates/remote/Cargo.toml
+# cargo chef prepare auto-discovers the workspace from the current directory
+RUN cargo chef prepare --recipe-path /app/recipe.json
 
 # ── Stage 3: Rust builder ─────────────────────────────────────────────────
 FROM rust:1.93-slim-bookworm AS builder
@@ -71,32 +69,30 @@ RUN apt-get update \
 
 RUN cargo install cargo-chef --locked
 
-WORKDIR /app
+WORKDIR /app/crates/remote
 
 # ── Rust dependency cache layer ───────────────────────────────────────────
-# Re-runs only when Cargo.lock changes — not on source changes
-COPY --from=planner /app/recipe.json recipe.json
-COPY rust-toolchain.toml ./
-COPY Cargo.toml Cargo.lock ./
-COPY crates/remote/Cargo.toml ./crates/remote/
-COPY crates/remote/Cargo.lock ./crates/remote/
+COPY --from=planner /app/recipe.json /app/recipe.json
+COPY crates/remote/Cargo.toml crates/remote/Cargo.lock ./
 
 # Strip private billing dep when building without FEATURES (self-hosted)
 RUN if [ -z "${FEATURES}" ]; then \
-      sed -i '/^billing = {.*vibe-kanban-private.*/d' crates/remote/Cargo.toml; \
-      sed -i '/^# private crate for billing/d' crates/remote/Cargo.toml; \
-      sed -i '/^vk-billing = \["dep:billing"\]/d' crates/remote/Cargo.toml; \
-      rm -f crates/remote/Cargo.lock; \
+      sed -i '/^billing = {.*vibe-kanban-private.*/d' Cargo.toml; \
+      sed -i '/^# private crate for billing/d' Cargo.toml; \
+      sed -i '/^vk-billing = \["dep:billing"\]/d' Cargo.toml; \
+      rm -f Cargo.lock; \
     fi
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo chef cook --release --recipe-path recipe.json --manifest-path crates/remote/Cargo.toml ${FEATURES:+--features ${FEATURES}}
+    cargo chef cook --release --recipe-path /app/recipe.json ${FEATURES:+--features ${FEATURES}}
 
 # ── Full source build ─────────────────────────────────────────────────────
-COPY crates crates
-COPY shared shared
-COPY assets assets
+WORKDIR /app
+
+COPY crates/remote ./crates/remote
+COPY shared ./shared
+COPY assets ./assets
 
 RUN mkdir -p /app/bin
 
