@@ -1,82 +1,58 @@
-# Build stage
-FROM node:24-alpine AS builder
+# renovate: datasource=github-releases depName=BloopAI/vibe-kanban
+ARG VERSION=v0.1.31-20260316163135
+# renovate: datasource=github-releases depName=BloopAI/vibe-kanban
+ARG BINARY_SHA256=55957726b58f768eaf264763fa3a32c2de9853df4324682c406a3e7f9a5570f5
 
-# Install build dependencies
-RUN apk add --no-cache \
-    curl \
-    build-base \
-    perl \
-    llvm-dev \
-    clang-dev
+# ── Stage 1: download pre-built binaries + frontend dist ─────────────────
+# No Rust or Node compilation needed — Bloop publishes ready-made binaries
+# for every release via https://npm-cdn.vibekanban.com
+FROM alpine:3.23 AS downloader
+ARG VERSION
+ARG BINARY_SHA256
 
-# Allow linking libclang on musl
-ENV RUSTFLAGS="-C target-feature=-crt-static"
+# hadolint ignore=DL3018
+RUN apk add --no-cache curl unzip ca-certificates
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+# Download pre-built server binary and verify SHA256
+RUN curl -fsSL "https://npm-cdn.vibekanban.com/binaries/${VERSION}/linux-x64/vibe-kanban.zip" \
+      -o /tmp/vibe-kanban.zip && \
+    echo "${BINARY_SHA256}  /tmp/vibe-kanban.zip" | sha256sum -c - && \
+    unzip /tmp/vibe-kanban.zip -d /tmp/ && \
+    chmod +x /tmp/vibe-kanban
 
-ARG POSTHOG_API_KEY
-ARG POSTHOG_API_ENDPOINT
+# Download frontend dist from GitHub release
+RUN curl -fsSL "https://github.com/BloopAI/vibe-kanban/releases/download/${VERSION}/vibe-kanban-${VERSION}.zip" \
+      -o /tmp/dist.zip && \
+    unzip /tmp/dist.zip -d /tmp/dist/
 
-ENV VITE_PUBLIC_POSTHOG_KEY=$POSTHOG_API_KEY
-ENV VITE_PUBLIC_POSTHOG_HOST=$POSTHOG_API_ENDPOINT
+# ── Stage 2: minimal runtime image ───────────────────────────────────────
+FROM alpine:3.23 AS runtime
 
-# Set working directory
-WORKDIR /app
-
-# Copy package files for dependency caching
-COPY package*.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY packages/local-web/package*.json ./packages/local-web/
-COPY npx-cli/package*.json ./npx-cli/
-
-# Install pnpm and dependencies
-RUN npm install -g pnpm && pnpm install
-
-# Copy source code
-COPY . .
-
-# Build application
-RUN npm run generate-types
-RUN cd packages/local-web && pnpm run build
-RUN cargo build --release --bin server
-
-# Runtime stage
-FROM alpine:latest AS runtime
-
-# Install runtime dependencies
+# hadolint ignore=DL3018
 RUN apk add --no-cache \
     ca-certificates \
     tini \
     libgcc \
-    wget
-
-# Create app user for security
-RUN addgroup -g 1001 -S appgroup && \
+    wget && \
+    addgroup -g 1001 -S appgroup && \
     adduser -u 1001 -S appuser -G appgroup
 
-# Copy binary from builder
-COPY --from=builder /app/target/release/server /usr/local/bin/server
+COPY --from=downloader /tmp/vibe-kanban /usr/local/bin/server
+COPY --from=downloader /tmp/dist/ /dist/
 
-# Create repos directory and set permissions
 RUN mkdir -p /repos && \
     chown -R appuser:appgroup /repos
 
-# Switch to non-root user
 USER appuser
 
-# Set runtime environment
 ENV HOST=0.0.0.0
 ENV PORT=3000
 EXPOSE 3000
 
-# Set working directory
 WORKDIR /repos
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --quiet --tries=1 --spider "http://${HOST:-localhost}:${PORT:-3000}" || exit 1
 
-# Run the application
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["server"]
